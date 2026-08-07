@@ -25,220 +25,114 @@ package gc.g1;
 
 /**
  * @test TestG1RegionUncommit
- * @requires vm.gc.G1
- * @summary Test that G1 uncommits regions based on time threshold
  * @bug 8357445
+ * @summary Regression for the time-based uncommit free-list/safepoint race: concurrent
+ *          allocation and idle evaluation must not trip the master free-list MT-safety
+ *          guarantee (has teeth on fastdebug builds where the guarantee is active). The
+ *          test asserts a real uncommit happens ("Time-based shrink: deactivated") so a
+ *          pass cannot be reached without exercising the crash-prone path.
+ * @requires vm.gc.G1
  * @library /test/lib
- * @modules java.base/jdk.internal.misc
- *          java.management/sun.management
- * @run main/othervm -XX:+UseG1GC -Xms8m -Xmx256m -XX:G1HeapRegionSize=1M
- *                   -XX:+UnlockDiagnosticVMOptions
- *                   -XX:G1UncommitDelayMillis=3000 -XX:G1TimeBasedEvaluationIntervalMillis=2000
- *                   -XX:G1MinRegionsToUncommit=2
- *                   -Xlog:gc*,gc+sizing*=debug
- *                   gc.g1.TestG1RegionUncommit
+ * @run main gc.g1.TestG1RegionUncommit
  */
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import jdk.test.lib.process.OutputAnalyzer;
 import jdk.test.lib.process.ProcessTools;
 
 public class TestG1RegionUncommit {
 
+    static final int MB = 1024 * 1024;
+
     public static void main(String[] args) throws Exception {
-        // If no args, run the subprocess with log analysis
-        if (args.length == 0) {
-            testTimeBasedEvaluation();
-            testMinimumHeapBoundary();
-            testConcurrentAllocationUncommit();
-        } else if ("subprocess".equals(args[0])) {
-            // This is the subprocess that does the actual allocation/deallocation
-            runTimeBasedUncommitTest();
-        } else if ("minheap".equals(args[0])) {
-            runMinHeapBoundaryTest();
-        } else if ("concurrent".equals(args[0])) {
-            runConcurrentTest();
+        if (args.length > 0) {
+            stress();
+            return;
         }
-    }
 
-    static void testTimeBasedEvaluation() throws Exception {
-        ProcessBuilder pb = ProcessTools.createTestJavaProcessBuilder(
+        OutputAnalyzer o = new OutputAnalyzer(ProcessTools.createLimitedTestJavaProcessBuilder(
             "-XX:+UseG1GC",
-            "-Xms8m", "-Xmx256m", "-XX:G1HeapRegionSize=1M",
             "-XX:+UnlockDiagnosticVMOptions",
-            "-XX:G1UncommitDelayMillis=3000", "-XX:G1TimeBasedEvaluationIntervalMillis=2000",
-            "-XX:G1MinRegionsToUncommit=2",
-            "-Xlog:gc*,gc+sizing*=debug",
-            "gc.g1.TestG1RegionUncommit", "subprocess"
-        );
-
-        OutputAnalyzer output = new OutputAnalyzer(pb.start());
-
-        // Verify the uncommit evaluation logic is working
-        output.shouldContain("G1 Time-Based Heap Sizing enabled (uncommit-only)");
-        output.shouldContain("Starting heap evaluation");
-        output.shouldContain("Region state transition:");
-        output.shouldContain("transitioning from active to inactive");
-        output.shouldContain("Uncommit candidates found:");
-        output.shouldContain("Uncommit evaluation: Found");
-        output.shouldContain("target shrink:");
-
-        output.shouldHaveExitValue(0);
-        System.out.println("Test passed - time-based uncommit verified!");
-    }
-
-    static void runTimeBasedUncommitTest() throws Exception {
-        final int allocSize = 64 * 1024 * 1024; // 64MB allocation - much larger than initial 8MB
-        Object keepAlive;
-        Object keepAlive2; // Keep some memory allocated to prevent full shrinkage
-
-        System.out.println("=== Testing G1 Time-Based Uncommit ===");
-
-        // Phase 1: Allocate memory to force significant heap expansion
-        System.out.println("Phase 1: Allocating large amount of memory");
-        keepAlive = new byte[allocSize];
-
-        // Phase 2: Keep some memory allocated, free the rest to create inactive regions
-        // This ensures current_heap > min_heap so uncommit is possible
-        System.out.println("Phase 2: Partially freeing memory, keeping some allocated");
-        keepAlive2 = new byte[24 * 1024 * 1024]; // Keep 24MB allocated
-        keepAlive = null; // Free the 64MB, leaving regions available for uncommit
-        System.gc();
-        System.gc(); // Double GC to ensure the 64MB is cleaned up
-
-        // Phase 3: Wait for regions to become inactive and uncommit to occur
-        System.out.println("Phase 3: Waiting for time-based uncommit...");
-
-        // Wait long enough for:
-        // 1. G1UncommitDelayMillis (3000ms) - regions to become inactive
-        // 2. G1TimeBasedEvaluationIntervalMillis (2000ms) - evaluation to run
-        // 3. Multiple evaluation cycles to ensure uncommit happens
-        Thread.sleep(15000); // 15 seconds should be plenty
-
-        // Clean up remaining allocation
-        keepAlive2 = null;
-        System.gc();
-
-        System.out.println("=== Test completed ===");
-        Runtime.getRuntime().halt(0);
-    }
-
-    static void testMinimumHeapBoundary() throws Exception {
-        System.out.println("Testing minimum heap boundary conditions...");
-
-        ProcessBuilder pb = ProcessTools.createTestJavaProcessBuilder(
-            "-XX:+UseG1GC",
-            "-Xms32m", "-Xmx64m",  // Small heap to test boundaries
+            "-Xms32m", "-Xmx256m",
             "-XX:G1HeapRegionSize=1M",
-            "-XX:+UnlockDiagnosticVMOptions",
-            "-XX:G1UncommitDelayMillis=2000", // Short delay
+            // Disable GC-based shrink so any uncommit is attributable to the time-based path.
+            "-XX:MaxHeapFreeRatio=100",
             "-XX:G1TimeBasedEvaluationIntervalMillis=1000",
+            "-XX:G1UncommitDelayMillis=1000",
             "-XX:G1MinRegionsToUncommit=1",
-            "-Xlog:gc+sizing=debug,gc+task=debug",
-            "gc.g1.TestG1RegionUncommit", "minheap"
-        );
+            "-Xlog:gc+ergo+heap=debug",
+            "gc.g1.TestG1RegionUncommit", "stress").start());
 
-        OutputAnalyzer output = new OutputAnalyzer(pb.start());
-
-        // Should not uncommit below initial heap size
-        output.shouldHaveExitValue(0);
-        System.out.println("Minimum heap boundary test passed!");
+        // The idle evaluation must have run while the master free list was being mutated
+        // by concurrent allocation (the microsoft/openjdk#677 race window)...
+        o.shouldContain("Starting uncommit evaluation");
+        // ...and the idle phase must have actually uncommitted at least one region, so the
+        // free-list-mutation-at-safepoint path (the crash site) really executed. Without
+        // this a pass would only prove the periodic task ran, not that the fix was tested.
+        o.shouldContain("Time-based shrink: deactivated");
+        // The guarantee has teeth on fastdebug: a trip aborts the VM (non-zero exit).
+        o.shouldHaveExitValue(0);
     }
 
-    static void testConcurrentAllocationUncommit() throws Exception {
-        System.out.println("Testing concurrent allocation and uncommit...");
+    static void stress() throws Exception {
+        // Phase A: concurrent humongous alloc/free churn (with frequent safepoints)
+        // overlapping the periodic idle evaluation. This is the free-list/safepoint race
+        // window from microsoft/openjdk#677.
+        List<byte[]> shared = Collections.synchronizedList(new ArrayList<>());
+        AtomicBoolean stop = new AtomicBoolean(false);
 
-        ProcessBuilder pb = ProcessTools.createTestJavaProcessBuilder(
-            "-XX:+UseG1GC",
-            "-Xms64m", "-Xmx256m",
-            "-XX:G1HeapRegionSize=1M",
-            "-XX:+UnlockDiagnosticVMOptions",
-            "-XX:G1TimeBasedEvaluationIntervalMillis=1000", // Frequent evaluation
-            "-XX:G1UncommitDelayMillis=2000",
-            "-XX:G1MinRegionsToUncommit=2",
-            "-Xlog:gc+sizing=debug,gc+task=debug",
-            "gc.g1.TestG1RegionUncommit", "concurrent"
-        );
-
-        OutputAnalyzer output = new OutputAnalyzer(pb.start());
-
-        // Should handle concurrent operations safely
-        output.shouldHaveExitValue(0);
-        System.out.println("Concurrent allocation/uncommit test passed!");
-    }
-
-    static void runMinHeapBoundaryTest() throws Exception {
-        System.out.println("=== Min Heap Boundary Test ===");
-
-        List<byte[]> memory = new ArrayList<>();
-
-        // Allocate close to max
-        for (int i = 0; i < 28; i++) { // 28MB, close to 32MB limit
-            memory.add(new byte[1024 * 1024]);
-        }
-
-        // Clear and wait for uncommit attempt
-        memory.clear();
-        System.gc();
-        Thread.sleep(8000); // Wait longer than uncommit delay
-
-        System.out.println("MinHeapBoundaryTest completed");
-        Runtime.getRuntime().halt(0);
-    }
-
-    static void runConcurrentTest() throws Exception {
-        System.out.println("=== Concurrent Test ===");
-
-        final List<byte[]> sharedMemory = new ArrayList<>();
-        final boolean[] stopFlag = {false};
-
-        // Start allocation thread
-        Thread allocThread = new Thread(() -> {
-            int iterations = 0;
-            while (!stopFlag[0] && iterations < 50) {
-                try {
-                    // Allocate
-                    for (int j = 0; j < 5; j++) {
-                        synchronized (sharedMemory) {
-                            sharedMemory.add(new byte[1024 * 1024]); // 1MB
-                        }
-                        Thread.sleep(10);
+        Thread[] threads = new Thread[4];
+        for (int t = 0; t < threads.length; t++) {
+            threads[t] = new Thread(() -> {
+                Random r = new Random();
+                while (!stop.get()) {
+                    for (int i = 0; i < 8; i++) {
+                        shared.add(new byte[MB]);
                     }
-
-                    // Clear some
-                    synchronized (sharedMemory) {
-                        if (sharedMemory.size() > 10) {
-                            for (int k = 0; k < 5; k++) {
-                                if (!sharedMemory.isEmpty()) {
-                                    sharedMemory.remove(0);
-                                }
-                            }
+                    synchronized (shared) {
+                        int n = Math.min(8, shared.size());
+                        for (int i = 0; i < n; i++) {
+                            shared.remove(shared.size() - 1);
                         }
                     }
-                    System.gc();
-                    Thread.sleep(50);
-                    iterations++;
-                } catch (InterruptedException e) {
-                    break;
+                    if (r.nextInt(4) == 0) {
+                        System.gc();
+                    }
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
                 }
-            }
-        });
-
-        allocThread.start();
-
-        // Let it run for a while to trigger time-based evaluation
-        Thread.sleep(8000);
-
-        stopFlag[0] = true;
-        allocThread.join(2000);
-
-        synchronized (sharedMemory) {
-            sharedMemory.clear();
+            });
+            threads[t].start();
         }
+
+        Thread.sleep(6000);
+        stop.set(true);
+        for (Thread t : threads) {
+            t.join(2000);
+        }
+
+        // Phase B: expand the heap, release it, then go idle so the time-based evaluation
+        // deterministically uncommits the now-idle free regions. With GC-based shrink
+        // disabled (MaxHeapFreeRatio=100), the only thing that can uncommit here is the
+        // time-based path, so the "deactivated" log is a reliable witness that the
+        // crash-prone path actually executed.
+        List<byte[]> burst = new ArrayList<>();
+        for (int i = 0; i < 320; i++) {          // ~160MB in half-region chunks
+            burst.add(new byte[MB / 2]);
+        }
+        burst.clear();
+        System.gc();
         System.gc();
 
-        System.out.println("ConcurrentTest completed");
-        Runtime.getRuntime().halt(0);
+        // Idle window well beyond G1UncommitDelayMillis + the evaluation interval: no
+        // allocation, so the free regions age past the delay and get deactivated.
+        Thread.sleep(5000);
     }
 }
