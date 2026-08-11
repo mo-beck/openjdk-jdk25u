@@ -26,20 +26,19 @@ package gc.g1;
 /**
  * @test TestG1RegionUncommit
  * @bug 8357445
- * @summary Regression for the time-based uncommit free-list/safepoint race: concurrent
- *          allocation and idle evaluation must not trip the master free-list MT-safety
- *          guarantee (has teeth on fastdebug builds where the guarantee is active). The
- *          test asserts a real uncommit happens ("Time-based shrink: deactivated") so a
- *          pass cannot be reached without exercising the crash-prone path.
+ * @summary Regression for the time-based uncommit free-list/safepoint bug
+ *          (microsoft/openjdk#677): grow then release the heap and go idle so a real
+ *          time-based region uncommit fires, and assert it happened ("Time-based shrink:
+ *          deactivated") so the free-list-mutation-at-safepoint path is actually
+ *          exercised. On fastdebug the master free-list MT-safety guarantee is active, so
+ *          an off-safepoint regression aborts the VM.
  * @requires vm.gc.G1
  * @library /test/lib
  * @run main gc.g1.TestG1RegionUncommit
  */
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
 import jdk.test.lib.process.OutputAnalyzer;
 import jdk.test.lib.process.ProcessTools;
@@ -47,6 +46,9 @@ import jdk.test.lib.process.ProcessTools;
 public class TestG1RegionUncommit {
 
     static final int MB = 1024 * 1024;
+
+    // Sink for the background mutator's allocations so they are not optimized away.
+    static volatile byte[] blackhole;
 
     public static void main(String[] args) throws Exception {
         if (args.length > 0) {
@@ -67,72 +69,58 @@ public class TestG1RegionUncommit {
             "-Xlog:gc+ergo+heap=debug",
             "gc.g1.TestG1RegionUncommit", "stress").start());
 
-        // The idle evaluation must have run while the master free list was being mutated
-        // by concurrent allocation (the microsoft/openjdk#677 race window)...
+        // The periodic evaluation must have run...
         o.shouldContain("Starting uncommit evaluation");
-        // ...and the idle phase must have actually uncommitted at least one region, so the
-        // free-list-mutation-at-safepoint path (the crash site) really executed. Without
-        // this a pass would only prove the periodic task ran, not that the fix was tested.
+        // ...and once the app went idle it must have actually uncommitted at least one
+        // region, i.e. the free-list-mutation-at-safepoint path (the #677 crash site)
+        // really executed. Without this a pass would only prove the periodic task ran.
         o.shouldContain("Time-based shrink: deactivated");
-        // The guarantee has teeth on fastdebug: a trip aborts the VM (non-zero exit).
+        // The master free-list MT-safety guarantee has teeth on fastdebug: a trip aborts
+        // the VM (non-zero exit).
         o.shouldHaveExitValue(0);
     }
 
     static void stress() throws Exception {
-        // Phase A: concurrent humongous alloc/free churn (with frequent safepoints)
-        // overlapping the periodic idle evaluation. This is the free-list/safepoint race
-        // window from microsoft/openjdk#677.
-        List<byte[]> shared = Collections.synchronizedList(new ArrayList<>());
+        // Grow the heap with a large retained block of normal-sized (non-humongous)
+        // objects, then release it and collect, so the regions become free but stay
+        // committed (GC-based shrink is disabled via MaxHeapFreeRatio=100). This leaves
+        // the time-based path a large pool of idle free regions to uncommit.
+        final int chunk = 64 * 1024;            // 64K: well below the 512K humongous threshold
+        final int count = 120 * MB / chunk;     // ~120MB retained, well under -Xmx
+        List<byte[]> retained = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            retained.add(new byte[chunk]);
+        }
+        retained.clear();
+        System.gc();                            // free the regions; MaxHeapFreeRatio=100 keeps them committed
+
+        // Keep only a light background mutator alive: the uncommit fires at a safepoint,
+        // so a running mutator gives the fastdebug master free-list guarantee something to
+        // race against, while staying light enough that GC overhead decays below the
+        // uncommit pre-check threshold and the bulk of the free regions remain idle. The
+        // feature only uncommits when the app is idle, so heavy allocation here would
+        // suppress it entirely.
         AtomicBoolean stop = new AtomicBoolean(false);
-
-        Thread[] threads = new Thread[4];
-        for (int t = 0; t < threads.length; t++) {
-            threads[t] = new Thread(() -> {
-                Random r = new Random();
-                while (!stop.get()) {
-                    for (int i = 0; i < 8; i++) {
-                        shared.add(new byte[MB]);
-                    }
-                    synchronized (shared) {
-                        int n = Math.min(8, shared.size());
-                        for (int i = 0; i < n; i++) {
-                            shared.remove(shared.size() - 1);
-                        }
-                    }
-                    if (r.nextInt(4) == 0) {
-                        System.gc();
-                    }
-                    try {
-                        Thread.sleep(5);
-                    } catch (InterruptedException e) {
-                        return;
-                    }
+        Thread mutator = new Thread(() -> {
+            while (!stop.get()) {
+                blackhole = new byte[4 * 1024];
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    return;
                 }
-            });
-            threads[t].start();
-        }
+            }
+        });
+        mutator.setDaemon(true);
+        mutator.start();
 
-        Thread.sleep(6000);
+        // Idle window well beyond G1UncommitDelayMillis + the evaluation interval: with the
+        // heap quiet, GC overhead falls under the pre-check threshold and the free regions
+        // age past the delay, so the time-based evaluation uncommits them at a safepoint
+        // over several cycles.
+        Thread.sleep(12000);
+
         stop.set(true);
-        for (Thread t : threads) {
-            t.join(2000);
-        }
-
-        // Phase B: expand the heap, release it, then go idle so the time-based evaluation
-        // deterministically uncommits the now-idle free regions. With GC-based shrink
-        // disabled (MaxHeapFreeRatio=100), the only thing that can uncommit here is the
-        // time-based path, so the "deactivated" log is a reliable witness that the
-        // crash-prone path actually executed.
-        List<byte[]> burst = new ArrayList<>();
-        for (int i = 0; i < 320; i++) {          // ~160MB in half-region chunks
-            burst.add(new byte[MB / 2]);
-        }
-        burst.clear();
-        System.gc();
-        System.gc();
-
-        // Idle window well beyond G1UncommitDelayMillis + the evaluation interval: no
-        // allocation, so the free regions age past the delay and get deactivated.
-        Thread.sleep(5000);
+        mutator.join(2000);
     }
 }
